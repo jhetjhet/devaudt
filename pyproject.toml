@@ -1,0 +1,23 @@
+[project]
+name = "devaudt"
+version = "0.1.0"
+description = "Deterministic static code analyzer for Python, TypeScript, and JavaScript repositories"
+readme = "README.md"
+authors = [
+    { name = "Austin Mallari", email = "villasanamallariaustin@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "networkx>=3.6.1",
+    "packaging>=26.2",
+    "pylint>=4.0.5",
+    "radon>=6.0.1",
+    "requests>=2.33.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12.0"]
+build-backend = "uv_build"
+
+[project.scripts]
+devaudt = "devaudt.cli:main"

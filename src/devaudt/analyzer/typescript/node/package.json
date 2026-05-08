@@ -1,0 +1,11 @@
+{
+  "name": "devintel-ts-analyzer",
+  "version": "1.0.0",
+  "description": "Node.js helper for deterministic TS/JS AST and dependency analysis",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "madge": "^6.1.0",
+    "ts-morph": "^21.0.1"
+  }
+}
