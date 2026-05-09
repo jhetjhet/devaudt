@@ -19,6 +19,7 @@ import sys
 
 from devaudt.analyzer import analyze_local, analyze_url
 from devaudt.analyzer.risk import RiskScoringEngine
+from devaudt.analyzer.correlation import EvidenceCorrelationEngine
 
 
 def _parse_args() -> argparse.Namespace:
@@ -44,6 +45,14 @@ def _parse_args() -> argparse.Namespace:
         "--risk-only", action="store_true",
         help="Output only the risk report (implies --risk)",
     )
+    p.add_argument(
+        "--correlate", action="store_true",
+        help="Run the Evidence Correlation Engine after risk scoring and append a 'correlation_report' key",
+    )
+    p.add_argument(
+        "--correlate-only", action="store_true",
+        help="Output only the correlation report (implies --risk and --correlate)",
+    )
     return p.parse_args()
 
 
@@ -63,17 +72,33 @@ def main() -> None:
 
     indent = args.indent if args.indent > 0 else None
 
-    run_risk = args.risk or args.risk_only
+    run_risk = args.risk or args.risk_only or args.correlate or args.correlate_only
     if run_risk:
-        print("[devintel] Running Risk Scoring Engine…", file=sys.stderr)
+        print("[devintel] Running Risk Scoring Engine\u2026", file=sys.stderr)
         risk_report = RiskScoringEngine().score(result)
         print(
-            f"[devintel] Risk scoring done — {risk_report.total_entities} entities profiled.",
+            f"[devintel] Risk scoring done \u2014 {risk_report.total_entities} entities profiled.",
             file=sys.stderr,
         )
 
-    if args.risk_only:
+    run_correlate = args.correlate or args.correlate_only
+    if run_correlate:
+        print("[devintel] Running Evidence Correlation Engine\u2026", file=sys.stderr)
+        correlation_report = EvidenceCorrelationEngine().correlate(risk_report)
+        print(
+            f"[devintel] Correlation done \u2014 {correlation_report.total_clusters} clusters found.",
+            file=sys.stderr,
+        )
+
+    if args.correlate_only:
+        payload = json.dumps(correlation_report.to_dict(), indent=indent, ensure_ascii=False)
+    elif args.risk_only:
         payload = json.dumps(risk_report.to_dict(), indent=indent, ensure_ascii=False)
+    elif run_correlate:
+        data = result.to_dict()
+        data["risk_report"] = risk_report.to_dict()
+        data["correlation_report"] = correlation_report.to_dict()
+        payload = json.dumps(data, indent=indent, ensure_ascii=False)
     elif run_risk:
         data = result.to_dict()
         data["risk_report"] = risk_report.to_dict()
