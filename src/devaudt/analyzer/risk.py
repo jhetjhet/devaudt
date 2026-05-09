@@ -92,6 +92,10 @@ class WeightedRiskProfile:
     issue_kinds: dict[str, int] = field(default_factory=dict)   # kind → count
     explanation: str = ""
 
+    # Structural context (from AuditContext) — used by the correlation layer
+    callers: list[str] = field(default_factory=list)   # files that import this entity's file
+    callees: list[str] = field(default_factory=list)   # files this entity's file imports
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "entity_id":           self.entity_id,
@@ -113,6 +117,8 @@ class WeightedRiskProfile:
             "issue_kinds":  self.issue_kinds,
             "top_issues":   self.top_issues,
             "explanation":  self.explanation,
+            "callers":      self.callers,
+            "callees":      self.callees,
         }
 
 
@@ -205,6 +211,7 @@ class RiskScoringEngine:
         ao_kind: dict[str, str] = {ao.entity_id: ao.kind for ao in result.audit_objects}
         ao_file: dict[str, str] = {ao.entity_id: ao.file for ao in result.audit_objects}
         ao_name: dict[str, str] = {ao.entity_id: ao.name for ao in result.audit_objects}
+        ao_ctx:  dict[str, Any] = {ao.entity_id: ao.context for ao in result.audit_objects}
 
         profiles: list[WeightedRiskProfile] = []
 
@@ -311,6 +318,18 @@ class RiskScoringEngine:
                 issue_count=len(entity_findings),
             )
 
+            # --- caller / callee context from AuditObject ---
+            ctx = ao_ctx.get(key)
+            entity_callers: list[str] = list(ctx.callers) if ctx else []
+            entity_callees: list[str] = list(ctx.callees) if ctx else []
+            # Fallback: pull from any finding's embedded context
+            if not entity_callers and not entity_callees:
+                for item in [*entity_findings, *entity_smells]:
+                    if item.context.callers or item.context.callees:
+                        entity_callers = list(item.context.callers)
+                        entity_callees = list(item.context.callees)
+                        break
+
             profiles.append(
                 WeightedRiskProfile(
                     entity_id=key,
@@ -329,6 +348,8 @@ class RiskScoringEngine:
                     top_issues=top_issues,
                     issue_kinds=dict(issue_kinds),
                     explanation=explanation,
+                    callers=entity_callers,
+                    callees=entity_callees,
                 )
             )
 
