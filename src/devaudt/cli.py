@@ -18,6 +18,7 @@ import json
 import sys
 
 from devaudt.analyzer import analyze_local, analyze_url
+from devaudt.analyzer.risk import RiskScoringEngine
 
 
 def _parse_args() -> argparse.Namespace:
@@ -34,6 +35,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--indent", type=int, default=2,
         help="JSON indentation level (default: 2, use 0 for compact)",
+    )
+    p.add_argument(
+        "--risk", action="store_true",
+        help="Run the Risk Scoring Engine and append a 'risk_report' key to the output",
+    )
+    p.add_argument(
+        "--risk-only", action="store_true",
+        help="Output only the risk report (implies --risk)",
     )
     return p.parse_args()
 
@@ -53,7 +62,24 @@ def main() -> None:
     print("[devintel] Analysis complete.", file=sys.stderr)
 
     indent = args.indent if args.indent > 0 else None
-    payload = json.dumps(result.to_dict(), indent=indent, ensure_ascii=False)
+
+    run_risk = args.risk or args.risk_only
+    if run_risk:
+        print("[devintel] Running Risk Scoring Engine…", file=sys.stderr)
+        risk_report = RiskScoringEngine().score(result)
+        print(
+            f"[devintel] Risk scoring done — {risk_report.total_entities} entities profiled.",
+            file=sys.stderr,
+        )
+
+    if args.risk_only:
+        payload = json.dumps(risk_report.to_dict(), indent=indent, ensure_ascii=False)
+    elif run_risk:
+        data = result.to_dict()
+        data["risk_report"] = risk_report.to_dict()
+        payload = json.dumps(data, indent=indent, ensure_ascii=False)
+    else:
+        payload = json.dumps(result.to_dict(), indent=indent, ensure_ascii=False)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
