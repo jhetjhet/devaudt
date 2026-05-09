@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -9,10 +10,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from ..base import BaseAnalyzer
+from ..base import BaseAnalyzer, extract_snippet
 from ..models import (
-    AnalysisResult, ArchitectureInfo, CodeSmell, DependenciesInfo, Evidence,
-    Finding, MetricsInfo, OutdatedPackage, SecurityFinding, SecurityInfo,
+    AnalysisResult, ArchitectureInfo, AuditContext, AuditObject, CodeSmell,
+    DependenciesInfo, Evidence, Finding, MetricsInfo, OutdatedPackage,
 )
 from ..repository import IGNORE_DIRS
 
@@ -92,16 +93,37 @@ class TypeScriptAnalyzer(BaseAnalyzer):
 
         findings:      list[Finding] = []
         smells:        list[CodeSmell] = []
-        sec_findings:  list[SecurityFinding] = []
+        sec_findings:  list[Finding] = []
+
+        # Lazy source cache for snippet extraction (file reads on demand)
+        _src_cache: dict[str, str] = {}
+
+        def _read_src(rp: str) -> str:
+            if rp not in _src_cache:
+                try:
+                    _src_cache[rp] = (self.repo_path / rp).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    _src_cache[rp] = ""
+            return _src_cache[rp]
 
         # --- convert Node security findings -------------------------------
         for ns in node_sec:
-            sec_findings.append(SecurityFinding(
-                type=ns.get("type", "unknown"),
-                file=ns.get("file", ""),
-                line=ns.get("line", 0),
+            _f = ns.get("file", "")
+            _l = ns.get("line", 0)
+            _t = ns.get("type", "unknown")
+            _key = f"{_f}\x00{_l}\x00{_t}"
+            _fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+            _eid = "ENTT-" + hashlib.sha256(f"{_f}\x00file\x00{_f}".encode()).hexdigest()[:8].upper()
+            sec_findings.append(Finding(
+                id=_fid, type=_t,
+                file=_f, line=_l,
                 severity=ns.get("severity", "medium"),
-                description=ns.get("description", ""),
+                title=ns.get("description", _t),
+                kind="security",
+                entity_id=_eid,
+                snippet=extract_snippet(_read_src(_f), _l),
             ))
 
         # --- per-function analysis ----------------------------------------
@@ -123,10 +145,16 @@ class TypeScriptAnalyzer(BaseAnalyzer):
 
             if sev:
                 fid = self.make_finding_id(rel, name, "large_function")
+                eid = self.make_entity_id(rel, "function", name)
+                _end = lineno + line_count - 1
                 findings.append(Finding(
                     id=fid, type="large_function", severity=sev,
                     title="Large Function Detected",
                     file=rel, symbol=name, line=lineno,
+                    end_line=_end,
+                    snippet=extract_snippet(_read_src(rel), lineno, _end),
+                    entity_id=eid,
+                    kind="performance",
                     evidence=[
                         Evidence(type="line_count", value=line_count,
                                  threshold=_FUNC_LINES_MEDIUM),
@@ -145,10 +173,16 @@ class TypeScriptAnalyzer(BaseAnalyzer):
 
             if csev:
                 fid = self.make_finding_id(rel, name, "high_complexity")
+                eid = self.make_entity_id(rel, "function", name)
+                _end = lineno + line_count - 1
                 findings.append(Finding(
                     id=fid, type="high_complexity", severity=csev,
                     title="High Cyclomatic Complexity",
                     file=rel, symbol=name, line=lineno,
+                    end_line=_end,
+                    snippet=extract_snippet(_read_src(rel), lineno, _end),
+                    entity_id=eid,
+                    kind="performance",
                     evidence=[Evidence(type="complexity", value=complexity,
                                        threshold=_COMPLEXITY_MEDIUM)],
                 ))
@@ -162,10 +196,14 @@ class TypeScriptAnalyzer(BaseAnalyzer):
                 psev = None
             if psev:
                 sid = self.make_finding_id(rel, name, "long_parameter_list")
+                eid = self.make_entity_id(rel, "function", name)
                 smells.append(CodeSmell(
                     id=sid, type="long_parameter_list", severity=psev,
                     title="Long Parameter List",
                     file=rel, symbol=name, line=lineno,
+                    snippet=extract_snippet(_read_src(rel), lineno),
+                    entity_id=eid,
+                    kind="maintainability",
                     evidence=[Evidence(type="param_count", value=param_count,
                                        threshold=_PARAM_LOW)],
                 ))
@@ -186,10 +224,16 @@ class TypeScriptAnalyzer(BaseAnalyzer):
                 csev = None
             if csev:
                 sid = self.make_finding_id(rel, name, "large_class")
+                eid = self.make_entity_id(rel, "class", name)
+                _end = lineno + line_count - 1
                 smells.append(CodeSmell(
                     id=sid, type="large_class", severity=csev,
                     title="Large Class Detected",
                     file=rel, symbol=name, line=lineno,
+                    end_line=_end,
+                    snippet=extract_snippet(_read_src(rel), lineno, _end),
+                    entity_id=eid,
+                    kind="maintainability",
                     evidence=[Evidence(type="line_count", value=line_count,
                                        threshold=_CLASS_LINES_MEDIUM)],
                 ))
@@ -202,10 +246,14 @@ class TypeScriptAnalyzer(BaseAnalyzer):
                 gsev = None
             if gsev:
                 sid = self.make_finding_id(rel, name, "god_object")
+                eid = self.make_entity_id(rel, "class", name)
                 smells.append(CodeSmell(
                     id=sid, type="god_object", severity=gsev,
                     title="God Object / Class Too Large",
                     file=rel, symbol=name, line=lineno,
+                    snippet=extract_snippet(_read_src(rel), lineno),
+                    entity_id=eid,
+                    kind="maintainability",
                     evidence=[Evidence(type="method_count", value=mc,
                                        threshold=_GOD_METHODS_MEDIUM)],
                 ))
@@ -228,9 +276,14 @@ class TypeScriptAnalyzer(BaseAnalyzer):
             for pat, ftype, sev in _SECRET_RE:
                 for m in pat.finditer(src):
                     lineno = src[: m.start()].count("\n") + 1
-                    sec_findings.append(SecurityFinding(
-                        type=ftype, file=rel, line=lineno, severity=sev,
-                        description=ftype,
+                    _key = f"{rel}\x00{lineno}\x00{ftype}"
+                    _fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                    _eid = "ENTT-" + hashlib.sha256(f"{rel}\x00file\x00{rel}".encode()).hexdigest()[:8].upper()
+                    sec_findings.append(Finding(
+                        id=_fid, type=ftype, file=rel, line=lineno, severity=sev,
+                        title=ftype, kind="security",
+                        entity_id=_eid,
+                        snippet=extract_snippet(src, lineno),
                     ))
 
         # --- dependency intelligence -------------------------------------
@@ -243,12 +296,52 @@ class TypeScriptAnalyzer(BaseAnalyzer):
         high_cx = sum(1 for f in functions if f.get("complexity", 0) >= _COMPLEXITY_MEDIUM)
         todo_count = len(todos)
 
-        sec_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for sf in sec_findings:
-            if sf.severity in sec_counts:
-                sec_counts[sf.severity] += 1
-
         self._circular_deps = [sorted(c) for c in circular]
+
+        # --- build audit objects -----------------------------------------
+        file_callees: dict[str, list[str]] = {}
+        file_callers: dict[str, list[str]] = {}
+        for src_file, tgt_file in self._import_edges:
+            file_callees.setdefault(src_file, []).append(tgt_file)
+            file_callers.setdefault(tgt_file, []).append(src_file)
+
+        # Module imports per file from Node data
+        file_modules: dict[str, list[str]] = {}
+        for imp in imports:
+            f = imp.get("file", "")
+            if f:
+                file_modules.setdefault(f, []).append(imp.get("module", ""))
+
+        audit_objects: list[AuditObject] = []
+        for fn in functions:
+            rel_f = fn.get("file", "")
+            name = fn.get("name", "<anonymous>")
+            eid = self.make_entity_id(rel_f, "function", name)
+            ctx = AuditContext(
+                imports=sorted(set(file_modules.get(rel_f, []))),
+                callers=sorted(set(file_callers.get(rel_f, []))),
+                callees=sorted(set(file_callees.get(rel_f, []))),
+            )
+            audit_objects.append(AuditObject(
+                entity_id=eid, kind="function",
+                name=name, file=rel_f,
+                confidence=1.0, context=ctx,
+            ))
+        for cls in classes:
+            rel_f = cls.get("file", "")
+            name = cls.get("name", "<anonymous>")
+            eid = self.make_entity_id(rel_f, "class", name)
+            ctx = AuditContext(
+                imports=sorted(set(file_modules.get(rel_f, []))),
+                callers=sorted(set(file_callers.get(rel_f, []))),
+                callees=sorted(set(file_callees.get(rel_f, []))),
+            )
+            audit_objects.append(AuditObject(
+                entity_id=eid, kind="class",
+                name=name, file=rel_f,
+                confidence=1.0, context=ctx,
+            ))
+        logger.debug("Built %d audit object(s)", len(audit_objects))
 
         return AnalysisResult(
             metrics=MetricsInfo(
@@ -257,20 +350,14 @@ class TypeScriptAnalyzer(BaseAnalyzer):
                 high_complexity_functions=high_cx,
                 todo_count=todo_count,
             ),
-            findings=findings,
-            security=SecurityInfo(
-                critical_count=sec_counts["critical"],
-                high_count=sec_counts["high"],
-                medium_count=sec_counts["medium"],
-                low_count=sec_counts["low"],
-                findings=sec_findings,
-            ),
+            findings=findings + sec_findings,
             code_smells=smells,
             architecture=ArchitectureInfo(),
             dependencies=DependenciesInfo(
                 outdated_packages=outdated,
                 unused_dependencies=unused,
             ),
+            audit_objects=audit_objects,
         )
 
     # ------------------------------------------------------------------
@@ -328,7 +415,7 @@ class TypeScriptAnalyzer(BaseAnalyzer):
         """Regex-only analysis when Node.js tooling is unavailable."""
         files = self._collect_files()
         logger.info("TypeScriptAnalyzer fallback: %d file(s) to scan", len(files))
-        sec_findings: list[SecurityFinding] = []
+        sec_findings: list[Finding] = []
         todo_count = 0
 
         for rel in files:
@@ -342,26 +429,20 @@ class TypeScriptAnalyzer(BaseAnalyzer):
             for pat, ftype, sev in _SECRET_RE:
                 for m in pat.finditer(src):
                     lineno = src[: m.start()].count("\n") + 1
-                    sec_findings.append(SecurityFinding(
-                        type=ftype, file=rel, line=lineno, severity=sev,
-                        description=ftype,
+                    _key = f"{rel}\x00{lineno}\x00{ftype}"
+                    _fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                    _eid = "ENTT-" + hashlib.sha256(f"{rel}\x00file\x00{rel}".encode()).hexdigest()[:8].upper()
+                    sec_findings.append(Finding(
+                        id=_fid, type=ftype, file=rel, line=lineno, severity=sev,
+                        title=ftype, kind="security",
+                        entity_id=_eid,
+                        snippet=extract_snippet(src, lineno),
                     ))
-
-        sec_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for sf in sec_findings:
-            if sf.severity in sec_counts:
-                sec_counts[sf.severity] += 1
 
         outdated, unused = self._analyze_package_json([])
         return AnalysisResult(
             metrics=MetricsInfo(todo_count=todo_count),
-            security=SecurityInfo(
-                critical_count=sec_counts["critical"],
-                high_count=sec_counts["high"],
-                medium_count=sec_counts["medium"],
-                low_count=sec_counts["low"],
-                findings=sec_findings,
-            ),
+            findings=sec_findings,
             dependencies=DependenciesInfo(
                 outdated_packages=outdated,
                 unused_dependencies=unused,

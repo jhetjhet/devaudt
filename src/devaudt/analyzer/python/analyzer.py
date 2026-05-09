@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -16,10 +17,10 @@ import networkx as nx
 
 logger = logging.getLogger(__name__)
 
-from ..base import BaseAnalyzer
+from ..base import BaseAnalyzer, extract_snippet
 from ..models import (
-    AnalysisResult, ArchitectureInfo, CodeSmell, DependenciesInfo, Evidence,
-    Finding, MetricsInfo, OutdatedPackage, SecurityFinding, SecurityInfo,
+    AnalysisResult, ArchitectureInfo, AuditContext, AuditObject, CodeSmell,
+    DependenciesInfo, Evidence, Finding, MetricsInfo, OutdatedPackage,
 )
 from ..repository import IGNORE_DIRS
 
@@ -195,6 +196,19 @@ _PYLINT_SYMBOL_MAP: dict[str, tuple[str, str]] = {
     "bare-except":             ("bare_except",         "low"),
 }
 
+# kind for each pylint-derived finding type (used in to_dict / hotspot map)
+_PYLINT_TYPE_KIND: dict[str, str] = {
+    "large_function":       "performance",
+    "high_complexity":      "performance",
+    "long_parameter_list":  "maintainability",
+    "god_object":           "maintainability",
+    "eval_usage":           "security",
+    "broad_exception":      "reliability",
+    "dangerous_default":    "reliability",
+    "unchecked_subprocess": "reliability",
+    "bare_except":          "reliability",
+}
+
 
 def _run_pylint(repo_path: Path, py_files: list[str]) -> list[dict]:
     if not py_files:
@@ -249,7 +263,7 @@ class PythonAnalyzer(BaseAnalyzer):
         all_classes:  list[dict] = []
         all_imports:  list[dict] = []
         todo_count = 0
-        sec_findings: list[SecurityFinding] = []
+        sec_findings: list[Finding] = []
         smells:       list[CodeSmell] = []
         findings:     list[Finding] = []
 
@@ -273,9 +287,14 @@ class PythonAnalyzer(BaseAnalyzer):
             for pat, ftype, sev in _SECRET_RE:
                 for m in pat.finditer(src):
                     lineno = src[: m.start()].count("\n") + 1
-                    sec_findings.append(SecurityFinding(
-                        type=ftype, file=rel, line=lineno, severity=sev,
-                        description=pat.pattern[:60],
+                    _key = f"{rel}\x00{lineno}\x00{ftype}"
+                    fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                    eid = self.make_entity_id(rel, "file", rel)
+                    sec_findings.append(Finding(
+                        id=fid, type=ftype, file=rel, line=lineno, severity=sev,
+                        title=pat.pattern[:60], kind="security",
+                        entity_id=eid,
+                        snippet=extract_snippet(src, lineno),
                     ))
 
             # --- collect AST nodes ----------------------------------------
@@ -301,10 +320,16 @@ class PythonAnalyzer(BaseAnalyzer):
                 if sev:
                     fid = self.make_finding_id(rel, fn["name"], "large_function")
                     evid = self.make_evidence_id(rel, fn["lineno"], "line_count")
+                    eid = self.make_entity_id(rel, "function", fn["name"])
+                    _end = fn["lineno"] + fn["line_count"] - 1
                     findings.append(Finding(
                         id=fid, type="large_function", severity=sev,
                         title="Large Function Detected",
                         file=rel, symbol=fn["name"], line=fn["lineno"],
+                        end_line=_end,
+                        snippet=extract_snippet(src, fn["lineno"], _end),
+                        entity_id=eid,
+                        kind="performance",
                         evidence=[
                             Evidence(type="line_count", value=fn["line_count"],
                                      threshold=_FUNC_LINES_MEDIUM),
@@ -322,10 +347,16 @@ class PythonAnalyzer(BaseAnalyzer):
 
                 if csev:
                     fid = self.make_finding_id(rel, fn["name"], "high_complexity")
+                    eid = self.make_entity_id(rel, "function", fn["name"])
+                    _end = fn["lineno"] + fn["line_count"] - 1
                     findings.append(Finding(
                         id=fid, type="high_complexity", severity=csev,
                         title="High Cyclomatic Complexity",
                         file=rel, symbol=fn["name"], line=fn["lineno"],
+                        end_line=_end,
+                        snippet=extract_snippet(src, fn["lineno"], _end),
+                        entity_id=eid,
+                        kind="performance",
                         evidence=[
                             Evidence(type="complexity", value=complexity,
                                      threshold=_COMPLEXITY_MEDIUM),
@@ -336,10 +367,16 @@ class PythonAnalyzer(BaseAnalyzer):
                 nesting = _max_nesting_depth(node)
                 if nesting >= _NESTING_MEDIUM:
                     sid = self.make_finding_id(rel, fn["name"], "deep_nesting")
+                    eid = self.make_entity_id(rel, "function", fn["name"])
+                    _end = fn["lineno"] + fn["line_count"] - 1
                     smells.append(CodeSmell(
                         id=sid, type="deep_nesting", severity="medium",
                         title="Deep Nesting Detected",
                         file=rel, symbol=fn["name"], line=fn["lineno"],
+                        end_line=_end,
+                        snippet=extract_snippet(src, fn["lineno"], _end),
+                        entity_id=eid,
+                        kind="maintainability",
                         evidence=[Evidence(type="nesting_depth", value=nesting,
                                            threshold=_NESTING_MEDIUM)],
                     ))
@@ -354,10 +391,14 @@ class PythonAnalyzer(BaseAnalyzer):
                     psev = None
                 if psev:
                     sid = self.make_finding_id(rel, fn["name"], "long_parameter_list")
+                    eid = self.make_entity_id(rel, "function", fn["name"])
                     smells.append(CodeSmell(
                         id=sid, type="long_parameter_list", severity=psev,
                         title="Long Parameter List",
                         file=rel, symbol=fn["name"], line=fn["lineno"],
+                        snippet=extract_snippet(src, fn["lineno"]),
+                        entity_id=eid,
+                        kind="maintainability",
                         evidence=[Evidence(type="param_count", value=param_count,
                                            threshold=_PARAM_LOW)],
                     ))
@@ -373,10 +414,16 @@ class PythonAnalyzer(BaseAnalyzer):
                     csev = None
                 if csev:
                     sid = self.make_finding_id(rel, cls["name"], "large_class")
+                    eid = self.make_entity_id(rel, "class", cls["name"])
+                    _end = cls["lineno"] + cls["line_count"] - 1
                     smells.append(CodeSmell(
                         id=sid, type="large_class", severity=csev,
                         title="Large Class Detected",
                         file=rel, symbol=cls["name"], line=cls["lineno"],
+                        end_line=_end,
+                        snippet=extract_snippet(src, cls["lineno"], _end),
+                        entity_id=eid,
+                        kind="maintainability",
                         evidence=[Evidence(type="line_count", value=cls["line_count"],
                                            threshold=_CLASS_LINES_MEDIUM)],
                     ))
@@ -391,10 +438,14 @@ class PythonAnalyzer(BaseAnalyzer):
                     gsev = None
                 if gsev:
                     sid = self.make_finding_id(rel, cls["name"], "god_object")
+                    eid = self.make_entity_id(rel, "class", cls["name"])
                     smells.append(CodeSmell(
                         id=sid, type="god_object", severity=gsev,
                         title="God Object / Class Too Large",
                         file=rel, symbol=cls["name"], line=cls["lineno"],
+                        snippet=extract_snippet(src, cls["lineno"]),
+                        entity_id=eid,
+                        kind="maintainability",
                         evidence=[Evidence(type="method_count", value=mc,
                                            threshold=_GOD_METHODS_MEDIUM)],
                     ))
@@ -410,6 +461,18 @@ class PythonAnalyzer(BaseAnalyzer):
         )
         # --- pylint integration ------------------------------------------
         logger.info("Running pylint on %d file(s)…", min(len(source_files), 50))
+        _src_cache: dict[str, str] = {}
+
+        def _read_src(rp: str) -> str:
+            if rp not in _src_cache:
+                try:
+                    _src_cache[rp] = (self.repo_path / rp).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    _src_cache[rp] = ""
+            return _src_cache[rp]
+
         for msg in _run_pylint(self.repo_path, source_files):
             sym = msg.get("symbol", "")
             if sym not in _PYLINT_SYMBOL_MAP:
@@ -419,10 +482,16 @@ class PythonAnalyzer(BaseAnalyzer):
             lineno = msg.get("line", 0)
             obj = msg.get("obj", "")
             fid = self.make_finding_id(rel_path, obj, ftype)
+            eid = self.make_entity_id(rel_path, "function", obj) if obj else self.make_entity_id(rel_path, "file", rel_path)
+            _kind = _PYLINT_TYPE_KIND.get(ftype, "maintainability")
+            _file_src = _read_src(rel_path)
             findings.append(Finding(
                 id=fid, type=ftype, severity=sev,
                 title=msg.get("message", sym),
                 file=rel_path, symbol=obj, line=lineno,
+                entity_id=eid,
+                kind=_kind,
+                snippet=extract_snippet(_file_src, lineno),
             ))
 
         # --- import graph & circular deps --------------------------------
@@ -433,6 +502,47 @@ class PythonAnalyzer(BaseAnalyzer):
             "Import graph: %d edge(s), %d cycle(s)",
             len(self._import_edges), len(self._circular_deps),
         )
+
+        # --- build audit objects -----------------------------------------
+        # Derive file-level import context from collected data
+        file_modules: dict[str, list[str]] = {}
+        for imp in all_imports:
+            file_modules.setdefault(imp["file"], []).append(imp["module"])
+
+        file_callees: dict[str, list[str]] = {}
+        file_callers: dict[str, list[str]] = {}
+        for src, tgt in self._import_edges:
+            file_callees.setdefault(src, []).append(tgt)
+            file_callers.setdefault(tgt, []).append(src)
+
+        audit_objects: list[AuditObject] = []
+        for fn in all_funcs:
+            rel_f = fn["file"]
+            eid = self.make_entity_id(rel_f, "function", fn["name"])
+            ctx = AuditContext(
+                imports=sorted(set(file_modules.get(rel_f, []))),
+                callers=sorted(set(file_callers.get(rel_f, []))),
+                callees=sorted(set(file_callees.get(rel_f, []))),
+            )
+            audit_objects.append(AuditObject(
+                entity_id=eid, kind="function",
+                name=fn["name"], file=rel_f,
+                confidence=1.0, context=ctx,
+            ))
+        for cls in all_classes:
+            rel_f = cls.get("file", "")
+            eid = self.make_entity_id(rel_f, "class", cls["name"])
+            ctx = AuditContext(
+                imports=sorted(set(file_modules.get(rel_f, []))),
+                callers=sorted(set(file_callers.get(rel_f, []))),
+                callees=sorted(set(file_callees.get(rel_f, []))),
+            )
+            audit_objects.append(AuditObject(
+                entity_id=eid, kind="class",
+                name=cls["name"], file=rel_f,
+                confidence=1.0, context=ctx,
+            ))
+        logger.debug("Built %d audit object(s)", len(audit_objects))
 
         # --- dependency analysis -----------------------------------------
         logger.info("Analyzing Python dependencies…")
@@ -451,10 +561,7 @@ class PythonAnalyzer(BaseAnalyzer):
         test_coverage = _estimate_test_coverage(source_files, test_files, all_funcs)
 
         # --- security counts ---------------------------------------------
-        sec_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for sf in sec_findings:
-            if sf.severity in sec_counts:
-                sec_counts[sf.severity] += 1
+        # (counts are computed in to_dict from findings with kind="security")
 
         return AnalysisResult(
             metrics=MetricsInfo(
@@ -464,20 +571,14 @@ class PythonAnalyzer(BaseAnalyzer):
                 test_coverage_estimate=test_coverage,
                 todo_count=todo_count,
             ),
-            findings=findings,
-            security=SecurityInfo(
-                critical_count=sec_counts["critical"],
-                high_count=sec_counts["high"],
-                medium_count=sec_counts["medium"],
-                low_count=sec_counts["low"],
-                findings=sec_findings,
-            ),
+            findings=findings + sec_findings,
             code_smells=smells,
             architecture=ArchitectureInfo(),
             dependencies=DependenciesInfo(
                 outdated_packages=outdated,
                 unused_dependencies=unused,  # list[str]; core will score & wrap
             ),
+            audit_objects=audit_objects,
         )
 
     # ------------------------------------------------------------------
@@ -620,6 +721,7 @@ def _collect_ast(
                 "lineno": node.lineno,
                 "line_count": (node.end_lineno or node.lineno) - node.lineno + 1,
                 "method_count": len(direct_methods),
+                "file": rel,
             })
             self._class_stack.append(node.name)
             self.generic_visit(node)
@@ -671,19 +773,25 @@ def _collect_ast(
 
 def _check_dangerous_calls(
     src: str, tree: ast.Module, rel: str,
-    sec_findings: list[SecurityFinding],
+    sec_findings: list[Finding],
 ) -> None:
     """AST-based detection of dangerous Python calls."""
+    _file_eid = "ENTT-" + hashlib.sha256(f"{rel}\x00file\x00{rel}".encode()).hexdigest()[:8].upper()
 
     class _SecVisitor(ast.NodeVisitor):
         def visit_Call(self, node: ast.Call):
             func = node.func
             # eval / exec / compile
             if isinstance(func, ast.Name) and func.id in {"eval", "exec", "compile"}:
-                sec_findings.append(SecurityFinding(
-                    type=f"{func.id}_usage", file=rel,
+                ftype = f"{func.id}_usage"
+                _key = f"{rel}\x00{node.lineno}\x00{ftype}"
+                fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                sec_findings.append(Finding(
+                    id=fid, type=ftype, file=rel,
                     line=node.lineno, severity="high",
-                    description=f"Direct call to {func.id}()",
+                    title=f"Direct call to {func.id}()", kind="security",
+                    entity_id=_file_eid,
+                    snippet=extract_snippet(src, node.lineno),
                 ))
             # os.system / os.popen
             if (
@@ -692,10 +800,15 @@ def _check_dangerous_calls(
                 and func.value.id == "os"
                 and func.attr in {"system", "popen"}
             ):
-                sec_findings.append(SecurityFinding(
-                    type="os_shell_call", file=rel,
+                ftype = "os_shell_call"
+                _key = f"{rel}\x00{node.lineno}\x00{ftype}"
+                fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                sec_findings.append(Finding(
+                    id=fid, type=ftype, file=rel,
                     line=node.lineno, severity="medium",
-                    description=f"os.{func.attr}() call",
+                    title=f"os.{func.attr}() call", kind="security",
+                    entity_id=_file_eid,
+                    snippet=extract_snippet(src, node.lineno),
                 ))
             # subprocess.run / Popen with shell=True
             if isinstance(func, ast.Attribute) and func.attr in {"run", "Popen", "call"}:
@@ -705,10 +818,15 @@ def _check_dangerous_calls(
                         and isinstance(kw.value, ast.Constant)
                         and kw.value.value is True
                     ):
-                        sec_findings.append(SecurityFinding(
-                            type="subprocess_shell_true", file=rel,
+                        ftype = "subprocess_shell_true"
+                        _key = f"{rel}\x00{node.lineno}\x00{ftype}"
+                        fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                        sec_findings.append(Finding(
+                            id=fid, type=ftype, file=rel,
                             line=node.lineno, severity="medium",
-                            description="subprocess called with shell=True",
+                            title="subprocess called with shell=True", kind="security",
+                            entity_id=_file_eid,
+                            snippet=extract_snippet(src, node.lineno),
                         ))
             # pickle.loads / pickle.load
             if (
@@ -717,10 +835,15 @@ def _check_dangerous_calls(
                 and func.value.id == "pickle"
                 and func.attr in {"loads", "load"}
             ):
-                sec_findings.append(SecurityFinding(
-                    type="unsafe_deserialization", file=rel,
+                ftype = "unsafe_deserialization"
+                _key = f"{rel}\x00{node.lineno}\x00{ftype}"
+                fid = "FIND-" + hashlib.sha256(_key.encode()).hexdigest()[:8].upper()
+                sec_findings.append(Finding(
+                    id=fid, type=ftype, file=rel,
                     line=node.lineno, severity="medium",
-                    description="pickle.loads() — arbitrary code execution risk",
+                    title="pickle.loads() — arbitrary code execution risk", kind="security",
+                    entity_id=_file_eid,
+                    snippet=extract_snippet(src, node.lineno),
                 ))
             self.generic_visit(node)
 
