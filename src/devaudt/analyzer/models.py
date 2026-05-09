@@ -3,7 +3,28 @@ from __future__ import annotations
 import dataclasses
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Severity enum  (internal; serialized as string in output)
+# ---------------------------------------------------------------------------
+
+class Severity(IntEnum):
+    LOW      = 1
+    MEDIUM   = 2
+    HIGH     = 3
+    CRITICAL = 4
+
+    @classmethod
+    def from_str(cls, s: str) -> "Severity":
+        return {
+            "low":      cls.LOW,
+            "medium":   cls.MEDIUM,
+            "high":     cls.HIGH,
+            "critical": cls.CRITICAL,
+        }.get(s.lower(), cls.LOW)
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +45,7 @@ class RepositoryInfo:
 class ArchitectureInfo:
     detected_pattern: str = "unknown"
     services: list[str] = field(default_factory=list)
+    confidence: float = 0.0
 
 
 @dataclass
@@ -57,6 +79,14 @@ class DependenciesInfo:
 
 
 @dataclass
+class AuditContext:
+    """Structural context for an audited entity."""
+    imports: list[str] = field(default_factory=list)   # modules imported by this entity's file
+    callers: list[str] = field(default_factory=list)   # files that import this entity's file
+    callees: list[str] = field(default_factory=list)   # files this entity's file imports
+
+
+@dataclass
 class Evidence:
     type: str = ""
     value: Any = None
@@ -72,25 +102,15 @@ class Finding:
     file: str = ""
     symbol: str = ""
     line: int = 0
+    end_line: int = 0          # inclusive end line (0 = unknown / single-line)
+    snippet: str = ""          # dedented, line-numbered code window around the finding
     evidence: list[Evidence] = field(default_factory=list)
-
-
-@dataclass
-class SecurityFinding:
-    type: str = ""
-    file: str = ""
-    line: int = 0
-    severity: str = "medium"
-    description: str = ""
-
-
-@dataclass
-class SecurityInfo:
-    critical_count: int = 0
-    high_count: int = 0
-    medium_count: int = 0
-    low_count: int = 0
-    findings: list[SecurityFinding] = field(default_factory=list)
+    entity_id: str = ""
+    related_findings: list[str] = field(default_factory=list)
+    confidence: float = 0.8
+    context: AuditContext = field(default_factory=AuditContext)
+    kind: str = ""
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -102,7 +122,15 @@ class CodeSmell:
     file: str = ""
     symbol: str = ""
     line: int = 0
+    end_line: int = 0          # inclusive end line (0 = unknown / single-line)
+    snippet: str = ""          # dedented, line-numbered code window around the finding
     evidence: list[Evidence] = field(default_factory=list)
+    entity_id: str = ""
+    related_findings: list[str] = field(default_factory=list)
+    confidence: float = 0.8
+    context: AuditContext = field(default_factory=AuditContext)
+    kind: str = ""
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -117,6 +145,21 @@ class EvidenceEntry:
     file: str = ""
     line: int = 0
     description: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Audit context / object model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuditObject:
+    """Central, referenceable entity identified during an audit run."""
+    entity_id: str = ""
+    kind: str = ""          # function | class | file | service | package
+    name: str = ""
+    file: str = ""
+    confidence: float = 0.0
+    context: AuditContext = field(default_factory=AuditContext)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +192,23 @@ class RelationshipsInfo:
 
 
 # ---------------------------------------------------------------------------
+# Hotspot map
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HotspotEntry:
+    """A file or entity that concentrates many issues — used by the context compressor."""
+    entity_id: str = ""
+    entity_kind: str = ""       # file | function | class
+    file: str = ""
+    overall_severity: str = "low"   # worst severity across all issues
+    issue_counts: dict[str, int] = field(default_factory=dict)   # kind → count
+    top_findings: list[dict] = field(default_factory=list)       # lightweight summaries
+    related_entities: list[str] = field(default_factory=list)    # callers/callees
+    total_weight: float = 0.0   # composite risk score
+
+
+# ---------------------------------------------------------------------------
 # Root result
 # ---------------------------------------------------------------------------
 
@@ -159,11 +219,11 @@ class AnalysisResult:
     metrics: MetricsInfo = field(default_factory=MetricsInfo)
     dependencies: DependenciesInfo = field(default_factory=DependenciesInfo)
     findings: list[Finding] = field(default_factory=list)
-    security: SecurityInfo = field(default_factory=SecurityInfo)
     code_smells: list[CodeSmell] = field(default_factory=list)
-    change_set: ChangeSet = field(default_factory=ChangeSet)
     relationships: RelationshipsInfo = field(default_factory=RelationshipsInfo)
     evidence_index: dict[str, EvidenceEntry] = field(default_factory=dict)
+    audit_objects: list[AuditObject] = field(default_factory=list)
+    hotspots: list[HotspotEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """
@@ -174,8 +234,15 @@ class AnalysisResult:
           - security findings sorted and counted
           - relationships sorted deterministically
           - unused dependencies with confidence + reasons
+          - hotspots computed from all findings + smells
         """
         from .scoring import severity_numeric, confidence_numeric
+
+        # ----------------------------------------------------------------
+        # Severity helpers (used in hotspot computation below)
+        # ----------------------------------------------------------------
+        from .scoring import _SEVERITY_NUMERIC
+        _SEV_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "": 0}
 
         # ----------------------------------------------------------------
         # Base serialization
@@ -187,20 +254,30 @@ class AnalysisResult:
         raw["repository"]["frameworks"] = sorted(raw["repository"]["frameworks"])
 
         # ---- findings: group by (file, symbol), compute numeric scores --
+        # security findings (kind="security") are emitted in the separate security section
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for f in self.findings:
+            if f.kind == "security":
+                continue
             primary_val = 0.0
             for ev in f.evidence:
                 primary_val = max(primary_val, ev.value or 0)
             sev_num = severity_numeric(f.severity, f.type, primary_val)
             conf    = confidence_numeric(f.type, len(f.evidence))
             issue = {
-                "id":          f.id,
-                "type":        f.type,
-                "severity":    sev_num,
-                "confidence":  conf,
-                "line":        f.line,
-                "evidence":    [dataclasses.asdict(e) for e in f.evidence],
+                "id":               f.id,
+                "type":             f.type,
+                "kind":             f.kind,
+                "severity":         sev_num,
+                "confidence":       conf,
+                "line":             f.line,
+                "end_line":         f.end_line,
+                "snippet":          f.snippet,
+                "evidence":         [dataclasses.asdict(e) for e in f.evidence],
+                "entity_id":        f.entity_id,
+                "related_findings": f.related_findings,
+                "tags":             f.tags,
+                "context":          dataclasses.asdict(f.context),
             }
             groups[(f.file, f.symbol)].append(issue)
 
@@ -236,16 +313,39 @@ class AnalysisResult:
         )
 
         # ---- security --------------------------------------------------
+        # Security findings are stored as Finding(kind="security") in self.findings
+        sec_findings_list = [f for f in self.findings if f.kind == "security"]
+        sec_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         sec_findings_out = []
-        for sf in self.security.findings:
-            from .scoring import _SEVERITY_NUMERIC
-            sf_d = dataclasses.asdict(sf)
-            sf_d["severity_numeric"] = _SEVERITY_NUMERIC.get(sf.severity.lower(), 5.0)
-            sec_findings_out.append(sf_d)
-        raw["security"]["findings"] = sorted(
-            sec_findings_out,
-            key=lambda s: (-s["severity_numeric"], s["file"], s["line"]),
-        )
+        for sf in sec_findings_list:
+            sev_str = sf.severity.lower()
+            if sev_str in sec_counts:
+                sec_counts[sev_str] += 1
+            sev_num = _SEVERITY_NUMERIC.get(sev_str, 5.0)
+            sec_findings_out.append({
+                "type":             sf.type,
+                "file":             sf.file,
+                "line":             sf.line,
+                "end_line":         sf.end_line,
+                "snippet":          sf.snippet,
+                "severity":         sf.severity,
+                "severity_numeric": sev_num,
+                "title":            sf.title,
+                "confidence":       sf.confidence,
+                "entity_id":        sf.entity_id,
+                "related_findings": sf.related_findings,
+                "tags":             sf.tags,
+            })
+        raw["security"] = {
+            "critical_count": sec_counts["critical"],
+            "high_count":     sec_counts["high"],
+            "medium_count":   sec_counts["medium"],
+            "low_count":      sec_counts["low"],
+            "findings": sorted(
+                sec_findings_out,
+                key=lambda s: (-s["severity_numeric"], s["file"], s["line"]),
+            ),
+        }
 
         # ---- dependencies: unused with confidence -----------------------
         raw["dependencies"]["unused_dependencies"] = sorted(
@@ -270,12 +370,103 @@ class AnalysisResult:
             raw["relationships"]["coupling_score"], 4
         )
 
-        # ---- change_set ------------------------------------------------
-        raw["change_set"]["changed_files"] = sorted(raw["change_set"]["changed_files"])
-        raw["change_set"]["added_files"]   = sorted(raw["change_set"]["added_files"])
-        raw["change_set"]["deleted_files"] = sorted(raw["change_set"]["deleted_files"])
-
         # ---- evidence_index --------------------------------------------
         raw["evidence_index"] = dict(sorted(raw["evidence_index"].items()))
 
+        # ---- audit_objects: sorted deterministically -------------------
+        raw["audit_objects"] = sorted(
+            raw["audit_objects"],
+            key=lambda ao: (ao["file"], ao["kind"], ao["name"]),
+        )
+
+        # ---- hotspots --------------------------------------------------
+        # Build AuditObject lookup for related_entities resolution
+        ao_by_eid: dict[str, AuditObject] = {ao.entity_id: ao for ao in self.audit_objects}
+        ao_by_file: dict[str, AuditObject] = {ao.file: ao for ao in self.audit_objects
+                                               if ao.kind == "file"}
+
+        # Gather all issues (findings + smells) keyed by entity_id
+        from collections import defaultdict as _dd
+        hs_issues: dict[str, list[dict]] = _dd(list)
+
+        for f in self.findings:
+            eid = f.entity_id or f.file  # fallback to file-level bucket
+            hs_issues[eid].append({
+                "id":       f.id,
+                "title":    f.title,
+                "severity": f.severity,
+                "kind":     f.kind,
+                "line":     f.line,
+                "file":     f.file,
+                "entity_id": f.entity_id,
+            })
+
+        for s in self.code_smells:
+            eid = s.entity_id or s.file
+            hs_issues[eid].append({
+                "id":       s.id,
+                "title":    s.title,
+                "severity": s.severity,
+                "kind":     s.kind,
+                "line":     s.line,
+                "file":     s.file,
+                "entity_id": s.entity_id,
+            })
+
+        # Severity weight map for total_weight scoring
+        _SEV_WEIGHT = {"critical": 10.0, "high": 6.0, "medium": 3.0, "low": 1.0}
+
+        hotspots_out: list[dict] = []
+        for eid, issues in hs_issues.items():
+            # Determine entity metadata from audit_objects or derive from file
+            ao = ao_by_eid.get(eid) or ao_by_file.get(eid)
+            entity_kind = ao.kind if ao else "file"
+            entity_file = ao.file if ao else (issues[0]["file"] if issues else "")
+
+            # Count issues by kind
+            issue_counts: dict[str, int] = {}
+            for iss in issues:
+                k = iss["kind"] or "unknown"
+                issue_counts[k] = issue_counts.get(k, 0) + 1
+
+            # Overall severity = worst individual severity
+            worst_sev = max(
+                (_SEV_ORDER.get(iss["severity"].lower(), 0) for iss in issues),
+                default=0,
+            )
+            overall_sev = {4: "critical", 3: "high", 2: "medium", 1: "low"}.get(worst_sev, "low")
+
+            # Total weight
+            total_weight = sum(
+                _SEV_WEIGHT.get(iss["severity"].lower(), 1.0) for iss in issues
+            )
+
+            # Top findings (up to 5, worst severity first)
+            top = sorted(issues, key=lambda x: (-_SEV_ORDER.get(x["severity"].lower(), 0), x["line"]))[:5]
+            top_findings = [
+                {"id": t["id"], "title": t["title"], "severity": t["severity"], "line": t["line"]}
+                for t in top
+            ]
+
+            # Related entities from audit_object context
+            related: list[str] = []
+            if ao:
+                related = sorted(set(ao.context.callers + ao.context.callees))
+
+            hotspots_out.append({
+                "entity_id":       eid,
+                "entity_kind":     entity_kind,
+                "file":            entity_file,
+                "overall_severity": overall_sev,
+                "issue_counts":    issue_counts,
+                "top_findings":    top_findings,
+                "related_entities": related,
+                "total_weight":    round(total_weight, 2),
+            })
+
+        # Sort by total_weight descending, then entity_id for determinism
+        hotspots_out.sort(key=lambda h: (-h["total_weight"], h["entity_id"]))
+        raw["hotspots"] = hotspots_out
+
         return raw
+

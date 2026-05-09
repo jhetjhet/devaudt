@@ -15,5 +15,8 @@ build/
 node_modules/
 src/devaudt/analyzer/typescript/node/node_modules/
 
+*.txt
+*.json
+
 # Ignore package-lock.json to avoid conflicts between different environments
 src/devaudt/analyzer/typescript/node/package-lock.json

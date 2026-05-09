@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 from .base import BaseAnalyzer
 from .models import (
-    AnalysisResult, ArchitectureInfo, DependenciesInfo, EvidenceEntry,
-    ImportEdge, MetricsInfo, RelationshipsInfo, RepositoryInfo, SecurityInfo,
+    AnalysisResult, ArchitectureInfo, AuditObject, DependenciesInfo,
+    EvidenceEntry, ImportEdge, MetricsInfo, RelationshipsInfo, RepositoryInfo,
     UnusedDependency,
 )
 from .repository import RepositoryScanner
@@ -101,9 +101,9 @@ def _merge(
     # ---- merge per-analyzer data -------------------------------------
     all_findings = []
     all_smells = []
-    all_sec_findings = []
     all_evidence: dict[str, EvidenceEntry] = {}
     all_import_edges: list[tuple[str, str]] = []
+    all_audit_objects: list[AuditObject] = []
 
     total_funcs = 0
     total_func_lines = 0.0
@@ -119,9 +119,9 @@ def _merge(
     for analyzer, result in partial_results:
         all_findings.extend(result.findings)
         all_smells.extend(result.code_smells)
-        all_sec_findings.extend(result.security.findings)
         all_evidence.update(analyzer._evidence_index)
         all_import_edges.extend(analyzer._import_edges)
+        all_audit_objects.extend(result.audit_objects)
         # circular deps collected by each analyzer (Python: list[list[str]])
         all_circular.extend(getattr(analyzer, "_circular_deps", []))
 
@@ -147,28 +147,10 @@ def _merge(
             all_used_modules.add(src)
 
     logger.debug(
-        "Collected: %d finding(s), %d smell(s), %d security finding(s), %d import edge(s)",
-        len(all_findings), len(all_smells), len(all_sec_findings), len(all_import_edges),
+        "Collected: %d finding(s), %d smell(s), %d import edge(s)",
+        len(all_findings), len(all_smells), len(all_import_edges),
     )
     avg_func_len = round(total_func_lines / total_funcs, 1) if total_funcs else 0.0
-
-    # ---- security -----------------------------------------------------
-    sec_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-    for sf in all_sec_findings:
-        if sf.severity in sec_counts:
-            sec_counts[sf.severity] += 1
-    security = SecurityInfo(
-        critical_count=sec_counts["critical"],
-        high_count=sec_counts["high"],
-        medium_count=sec_counts["medium"],
-        low_count=sec_counts["low"],
-        findings=sorted(all_sec_findings, key=lambda s: (s.file, s.line, s.type)),
-    )
-    logger.info(
-        "Security totals: critical=%d high=%d medium=%d low=%d",
-        sec_counts["critical"], sec_counts["high"],
-        sec_counts["medium"], sec_counts["low"],
-    )
 
     # ---- architecture -------------------------------------------------
     pattern = scanner.detect_architecture_pattern(all_files)
@@ -177,6 +159,7 @@ def _merge(
     architecture = ArchitectureInfo(
         detected_pattern=pattern,
         services=services,
+        confidence=0.9 if pattern != "unknown" else 0.5,
     )
     logger.info("Architecture: pattern=%s, services=%s", pattern, services)
 
@@ -238,20 +221,48 @@ def _merge(
     deduped_findings = _dedup(all_findings)
     deduped_smells = _dedup(all_smells)
     logger.info(
-        "Analysis complete: %d finding(s), %d code smell(s), %d security finding(s)",
-        len(deduped_findings), len(deduped_smells), len(security.findings),
+        "Analysis complete: %d finding(s), %d code smell(s)",
+        len(deduped_findings), len(deduped_smells),
     )
+
+    # ---- populate related_findings by entity_id ----------------------
+    from collections import defaultdict
+    entity_finding_ids: dict[str, list[str]] = defaultdict(list)
+    for f in deduped_findings:
+        if f.entity_id:
+            entity_finding_ids[f.entity_id].append(f.id)
+    for s in deduped_smells:
+        if s.entity_id:
+            entity_finding_ids[s.entity_id].append(s.id)
+    for f in deduped_findings:
+        if f.entity_id:
+            f.related_findings = sorted(
+                x for x in entity_finding_ids[f.entity_id] if x != f.id
+            )
+    for s in deduped_smells:
+        if s.entity_id:
+            s.related_findings = sorted(
+                x for x in entity_finding_ids[s.entity_id] if x != s.id
+            )
+
+    # ---- deduplicate audit objects by entity_id ----------------------
+    seen_eids: set[str] = set()
+    deduped_audit_objects: list[AuditObject] = []
+    for ao in sorted(all_audit_objects, key=lambda a: (a.file, a.kind, a.name)):
+        if ao.entity_id not in seen_eids:
+            seen_eids.add(ao.entity_id)
+            deduped_audit_objects.append(ao)
+    logger.debug("Audit objects: %d unique", len(deduped_audit_objects))
     return AnalysisResult(
         repository=repository,
         architecture=architecture,
         metrics=metrics,
         dependencies=dependencies,
         findings=deduped_findings,
-        security=security,
         code_smells=deduped_smells,
-        change_set=scanner.get_change_set(),
         relationships=relationships,
         evidence_index=dict(sorted(all_evidence.items())),
+        audit_objects=deduped_audit_objects,
     )
 
 
